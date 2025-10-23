@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"time"
 
 	"github.com/getlantern/systray"
+	"github.com/gin-gonic/gin"
 	"github.com/go-toast/toast"
 	"golang.design/x/clipboard"
 	"golang.org/x/sys/windows"
@@ -24,18 +25,44 @@ var iconData []byte
 
 var (
 	serverRunning bool
-	server        *http.Server
+	server        *gin.Engine
+	serverThread  *httpServerWrapper
 	logFile       *os.File
 	logLock       sync.Mutex
 )
 
-// go build -ldflags="-H=windowsgui" -o sms-service.exe
+// ---------- 包装 gin.Server 用于控制启动停止 ----------
+type httpServerWrapper struct {
+	addr   string
+	server *gin.Engine
+	stopCh chan struct{}
+}
+
+func (s *httpServerWrapper) Start() {
+	go func() {
+		writeLog("监听端口", s.addr)
+		err := s.server.Run(s.addr)
+		if err != nil {
+			writeLog("HTTP 启动错误:", err)
+		}
+	}()
+}
+
+func (s *httpServerWrapper) Stop() {
+	// Gin 没有直接 Close，需要 http.Server 实例时才能优雅关闭。
+	// 这里可以简单退出 goroutine。
+	close(s.stopCh)
+	writeLog("HTTP 服务关闭")
+}
+
+// go build -ldflags="-H=windowsgui" -o sms_service.exe
+// ---------- 主函数 ----------
 func main() {
 	setupLog()
 	systray.Run(onReady, onExit)
 }
 
-// ---------- 日志部分 ----------
+// ---------- 日志 ----------
 func setupLog() {
 	var err error
 	logFile, err = os.OpenFile("sms-service.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -52,10 +79,10 @@ func writeLog(v ...any) {
 	logLock.Lock()
 	defer logLock.Unlock()
 	log.Println(v...)
-	logFile.Sync() // 强制写入磁盘
+	logFile.Sync()
 }
 
-// ---------- 托盘初始化 ----------
+// ---------- 托盘 ----------
 func onReady() {
 	systray.SetIcon(iconData)
 	systray.SetTitle("短信服务")
@@ -69,12 +96,21 @@ func onReady() {
 
 	mStop.Disable()
 
+	// ✅ 启动托盘时自动启动一次服务
+	go func() {
+		startServer()
+		serverRunning = true
+		mStart.Disable()
+		mStop.Enable()
+		writeLog("HTTP 服务已自动启动")
+	}()
+
 	go func() {
 		for {
 			select {
 			case <-mStart.ClickedCh:
 				if !serverRunning {
-					go startServer()
+					startServer()
 					serverRunning = true
 					mStart.Disable()
 					mStop.Enable()
@@ -99,7 +135,6 @@ func onReady() {
 					mAuto.Check()
 					writeLog("已启用开机自启")
 				}
-
 			case <-mLog.ClickedCh:
 				exec.Command("notepad.exe", "sms-service.log").Start()
 			case <-mQuit.ClickedCh:
@@ -111,66 +146,78 @@ func onReady() {
 	}()
 }
 
-// ---------- 服务 ----------
+// ---------- Gin 服务 ----------
 func startServer() {
-	http.HandleFunc("/copy", handleCopy)
-	http.HandleFunc("/msg", handleMsg)
-	server = &http.Server{Addr: ":9002"}
-	writeLog("监听端口 :9002 ...")
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.Default()
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		writeLog("HTTP 启动错误:", err)
+	r.POST("/copy", func(c *gin.Context) {
+		content := c.PostForm("content")
+		writeLog("收到 /copy 消息:", content)
+		showToast("手机短信", content)
+
+		reCode := regexp.MustCompile(`验证码[\s\S]*?(\d+)`)
+		matches := reCode.FindStringSubmatch(content)
+		code := ""
+		if len(matches) > 1 {
+			code = matches[1]
+			writeLog("提取验证码:", code)
+		} else {
+			showToast("手机短信", "未找到验证码")
+			writeLog("未找到验证码")
+		}
+
+		if err := clipboard.Init(); err == nil {
+			clipboard.Write(clipboard.FmtText, []byte(code))
+			pasteClipboard()
+		}
+		c.String(200, "success")
+	})
+
+	r.POST("/msg", func(c *gin.Context) {
+		content := c.PostForm("content")
+		if content != "" {
+			writeLog("收到 /msg 消息:", content)
+			showToast("手机消息", content)
+		}
+		c.String(200, "success")
+	})
+
+	serverThread = &httpServerWrapper{
+		addr:   ":9002",
+		server: r,
+		stopCh: make(chan struct{}),
 	}
+
+	serverThread.Start()
 }
 
 func stopServer() {
-	if server != nil {
-		_ = server.Close()
-		writeLog("HTTP 服务关闭")
+	if serverThread != nil {
+		serverThread.Stop()
 	}
 }
 
-// ---------- 业务 ----------
-func handleCopy(w http.ResponseWriter, r *http.Request) {
-	content := r.FormValue("content")
-	writeLog("收到 /copy 消息:", content)
-	showToast("手机短信", content)
-	reCode := regexp.MustCompile(`验证码[\s\S]*?(\d+)`)
-	matches := reCode.FindStringSubmatch(content)
-	code := ""
-	if len(matches) > 1 {
-		code = matches[1]
-		writeLog("提取验证码:", code)
-	} else {
-		showToast("手机短信", "未找到验证码")
-		writeLog("未找到验证码")
-	}
-
-	if err := clipboard.Init(); err == nil {
-		clipboard.Write(clipboard.FmtText, []byte(code))
-		pasteClipboard()
-	}
-	w.Write([]byte("success"))
-}
-
-func handleMsg(w http.ResponseWriter, r *http.Request) {
-	content := r.FormValue("content")
-	if content != "" {
-		writeLog("收到 /msg 消息:", content)
-		showToast("手机消息", content)
-	}
-	w.Write([]byte("success"))
-}
-
-// ---------- 通知 ----------
+// ---------- Toast ----------
 func showToast(title, msg string) {
+	iconPath, _ := extractIcon()
 	notification := toast.Notification{
 		AppID:   "短信服务",
 		Title:   title,
 		Message: msg,
-		Icon:    "D:\\code\\go\\sms_tray_service\\assets\\icon.ico",
+		Icon:    iconPath,
 	}
 	notification.Push()
+}
+
+func extractIcon() (string, error) {
+	tmpDir := os.TempDir()
+	iconPath := filepath.Join(tmpDir, "tray_icon.ico")
+	err := os.WriteFile(iconPath, iconData, 0644)
+	if err != nil {
+		return "", err
+	}
+	return iconPath, nil
 }
 
 // ---------- 模拟粘贴 ----------
@@ -196,7 +243,7 @@ func onExit() {
 	logFile.Close()
 }
 
-// ---------- 开机自启功能 ----------
+// ---------- 开机自启 ----------
 func enableAutoRun(name, path string) {
 	k, _, err := registry.CreateKey(registry.CURRENT_USER,
 		`Software\Microsoft\Windows\CurrentVersion\Run`,
